@@ -1,5 +1,6 @@
 # macOS System Audio Capture with `SystemAudioDump`
 
+
 Glass uses a small native helper, [`SystemAudioDump`](../src/ui/assets/SystemAudioDump), to stream macOS system audio into the Speech‑to‑Text (STT) pipeline. The helper taps the CoreAudio output device and writes raw PCM data to `stdout`, which the STT service ingests and forwards to the "Them" transcription session.
 
 ## Launch sequence
@@ -15,12 +16,12 @@ Glass uses a small native helper, [`SystemAudioDump`](../src/ui/assets/SystemAud
 - The encoded audio is forwarded both to the renderer (`system-audio-data`) and to the active "Them" STT WebSocket session. Provider‑specific payloads are constructed as needed (e.g., Gemini expects `{ audio: { data, mimeType } }`, Deepgram receives raw buffers).
 
 ## Lifecycle management
-
 - `stderr` output from `SystemAudioDump` is logged for troubleshooting.
 - When the helper exits or errors, the service clears its reference and stops sending audio.
 - Calling `stopMacOSAudioCapture` sends a `SIGTERM` to the helper, ensuring a clean shutdown.
 
 ## Integration notes
+
 
 - On macOS, screen capture is obtained separately via `getDisplayMedia`; system audio never travels through the browser APIs.
 - Windows relies on `getDisplayMedia({ audio: true })` for loopback capture, while Linux currently disables system audio capture.
