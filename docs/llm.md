@@ -1,49 +1,93 @@
 # LLM Integration
 
-This document explains how Glass talks to large language models (LLMs) for real‑time summaries and interactive Q&A.
+Glass orchestrates multiple services to talk with large language models (LLMs) for live conversation summaries and interactive Q&A. This unified design document consolidates the runtime behavior and prompts used across the application.
 
 ## Provider Abstraction
 
-LLM access is routed through provider modules. The OpenAI provider creates either standard or streaming clients around the `chat.completions` endpoint. The non‑streaming client wraps the `openai` SDK or a Portkey proxy and returns the generated text. The streaming variant performs an HTTP request with `stream: true` so callers can process tokens incrementally.
+LLM access is routed through provider modules so higher-level services remain provider-agnostic.
 
-## Runtime Summary Generation
+### Factory overview
 
-`SummaryService` keeps a rolling conversation history. Each turn is appended with the speaker label and triggers an analysis check. When enough turns accumulate, the service builds a prompt that includes recent dialogue and any previous analysis. It retrieves the current model selection, creates an LLM instance, and sends a chat request. The returned summary is parsed and stored for later display and persistence.
+- The provider factory in `src/features/common/ai/factory.js` normalizes provider identifiers, sanitizes model names, and instantiates the correct handler for both synchronous and streaming calls.
+- `createLLM(provider, opts)` and `createStreamingLLM(provider, opts)` fetch the handler from the `PROVIDERS` map, rewrite `openai-glass` to the OpenAI handler, and then call the provider-specific constructor.
+- Additional providers (Anthropic, Gemini, Ollama, etc.) expose the same surface area, so services only supply provider id, model, API key, and optional Portkey parameters.
 
-To stay within model limits, only the most recent 30 conversation turns are formatted into the prompt. Older dialogue is dropped, and any prior analysis is compressed into a small `contextualPrompt` containing the last topic, up to three key points, and two action items. This keeps requests concise while still carrying forward useful context.
+### OpenAI handler
 
-### Summary Prompt
+- The OpenAI provider builds chat-completion clients. Standard requests wrap the `openai` SDK or a Portkey proxy and return both the generated text and the raw response.
+- Streaming requests always perform an HTTP POST with `stream: true` so callers can process Server Sent Events (SSE) tokens incrementally.
 
-The prompt begins with a system message instructing the model to produce a concise recap of the conversation. Recent turns are appended as user and assistant messages, followed by any prior summary. The final user message asks the model to output bullet points and action items in markdown.
+### Prompt templating utilities
 
-## Interactive Q&A
+- `getSystemPrompt` injects live conversation transcripts or screen context into the template before messages are sent, ensuring every request carries the latest meeting state.
 
-`AskService` powers ad‑hoc questions. It gathers the user’s prompt, captures a screenshot for context, and prepares a multimodal message. A streaming LLM is then created, and its response stream is forwarded to the UI. Tokens are decoded as they arrive and appended to the current response, with the final text saved to storage when the stream ends.
+## Summary Workflow
 
-### Q&A Prompt
+`SummaryService` (`src/features/listen/summary/summaryService.js`) keeps a rolling view of the meeting transcript and periodically asks the model for a structured recap.
 
-The service composes a system message that describes the screenshot and the expected style of answer. The user's question is added as the next message. If an image is present, it is attached using the OpenAI image content block. The model is asked to respond conversationally while citing on‑screen elements when relevant.
+### Conversation buffering
+
+- Each transcript turn is recorded as `"speaker: text"` via `addConversationTurn`, which trims whitespace and appends the value to `conversationHistory`.
+- `triggerAnalysisIfNeeded` runs whenever a turn is added and dispatches a summary request each time the history length is a multiple of five (5, 10, 15, …) so recaps update at predictable intervals.
+- `formatConversationForPrompt` slices the most recent 30 turns so prompts stay within model limits. Older dialogue is dropped, while previous analysis is compressed into a small `contextualPrompt` containing the last topic, up to three key points, and two action items.
+
+### Prompt assembly
+
+- `makeOutlineAndRequests` renders the `pickle_glass_analysis` system prompt with the formatted transcript and, when an earlier summary exists, prepends the handcrafted `contextualPrompt`.
+- The user message includes the contextual block (if any) followed by a markdown instruction template that the model must follow, which requests bullet points and action items.
+
+### Model invocation and persistence
+
+- The current model configuration is pulled from `modelStateService`. With the resolved provider, the service instantiates a client through `createLLM` (temperature `0.7`, `maxTokens` `1024`, and Portkey settings when applicable) and sends the chat request.
+- The response body is parsed with `parseResponseText`, which walks the markdown sections, merges them with any previous result, enforces bullet limits, and seeds default follow-up actions.
+- Successful calls are persisted through `summaryRepository.saveSummary`, stored in `analysisHistory`, and emitted to the UI via both the Electron channel and optional callbacks. Failures return the last known analysis.
+
+## Interactive Q&A Workflow
+
+`AskService` (`src/features/ask/askService.js`) streams answers to ad-hoc questions while capturing the current screen for additional context.
+
+### Request intake
+
+- `processMessage` obtains or creates an Ask session, logs the user prompt to the database, and resolves the active model configuration.
+- A medium-quality screenshot is captured with `captureScreenshot`; failures simply skip the image. Conversation history is formatted into markdown paragraphs for the prompt seed.
+
+### Prompt assembly and multimodal payloads
+
+- The system message again relies on `pickle_glass_analysis`. The user message starts with a text block ("User Request: …") and conditionally adds an `image_url` payload when a screenshot is available, producing a multimodal request that OpenAI Vision models can consume.
+
+### Streaming response, retries, and persistence
+
+- A streaming client is created through `createStreamingLLM` with `maxTokens` `2048`. The service validates that the Ask window is still alive before consuming the SSE stream.
+- `_processStream` decodes each `data:` line, extracts incremental tokens, updates UI state, and appends the growing answer to `currentResponse`. When the stream completes, the full response is saved to the session transcript.
+- If the multimodal call fails with an image-related error, the service automatically retries with a text-only payload while preserving the same streaming pipeline.
+- Any exception updates the Ask window with an error event and resets service state. Completed answers are written back to the database even when the stream ended due to cancellation.
 
 ## Workflow Diagram
 
 ```mermaid
 flowchart TD
     subgraph Summary
-    A[Turn received] --> B[Append to history]
-    B --> C{Enough turns?}
-    C -- yes --> D[Build summary prompt]
-    D --> E[Call LLM]
-    E --> F[Store and display summary]
-    C -- no --> B
+        A[Turn received] --> B[Append "speaker: text" to history]
+        B --> C{History length % 5 === 0?}
+        C -- yes --> D[Slice last 30 turns]
+        D --> E[Inject transcript into pickle_glass_analysis]
+        E --> F[Prepend contextualPrompt + summary template]
+        F --> G[createLLM(provider) → chat()]
+        G --> H[parseResponseText & merge with prior]
+        H --> I[saveSummary + emit to UI]
+        C -- no --> B
     end
 
     subgraph Q&A
-    G[User question] --> H[Capture screenshot]
-    H --> I[Build multimodal prompt]
-    I --> J[Stream LLM response]
-    J --> K[Render tokens in UI]
+        J[User submits question] --> K[Persist prompt & capture screenshot]
+        K --> L[Build system + user messages]
+        L --> M[createStreamingLLM(provider) → streamChat()]
+        M --> N[_processStream decodes SSE tokens]
+        N --> O[Update UI state & persist final answer]
+        M -- multimodal error --> P[Retry with text-only messages]
     end
 ```
+
 
 ## Prompt Templates
 
